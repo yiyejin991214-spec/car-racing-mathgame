@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="ko"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;700&family=Jua&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.9.3/dist/confetti.browser.min.js"></script>
+<title>수학 레이싱</title>
+<script src="config.js"></script><script src="common.js"></script>
+</head><body><main class="wrap narrow">
+
+<section id="v-join" class="view glass">
+  <h1 class="center en">Math Race 🏁</h1>
+  <label>방 번호</label><input id="room" class="num" inputmode="numeric" maxlength="4" placeholder="4자리">
+  <label>내 이름 (별명도 좋아요, 1~10자)</label><input id="nick" maxlength="10">
+  <label>내 자동차</label><div id="vehs" class="vehs"></div>
+  <button id="go" class="btn btn-violet" style="width:100%">들어가기</button><p id="err" class="err"></p>
+</section>
+
+<section id="v-wait" class="view glass center" hidden>
+  <div id="wv" class="big" style="font-size:90px"></div><h2 id="wn"></h2>
+  <p id="wmsg" class="glass">선생님이 시작하면 바로 문제가 나와요!</p>
+  <p><a href="#" id="again">다른 이름으로 다시 들어가기</a></p>
+</section>
+
+<section id="v-play" class="view" hidden>
+  <div class="glass hdrs"><span><span id="pv"></span> <span id="pn"></span></span><span id="score" class="score num">0점</span></div>
+  <div class="hdrs" style="margin:10px 4px 4px"><small id="qno"></small><b id="tm" class="num">00:00</b></div>
+  <div class="bar"><i id="bar" style="width:100%"></i></div>
+  <div id="gold" class="gold center" hidden style="margin-top:8px">⚡ 골든 타임! 정답 2점</div>
+  <div class="glass qcard"><span id="topic" class="pill"></span><div id="q" class="q en"></div><div id="plus" class="plus num"></div></div>
+  <div id="opts" class="opts"></div>
+</section>
+
+<section id="v-end" class="view glass center" hidden>
+  <h2>게임 끝!</h2><div id="ev" class="big"></div><div id="en" style="font-size:20px"></div>
+  <div id="rank" class="num" style="font-size:72px;color:#5b3fb0"></div><div id="es"></div>
+  <h3>TOP 5</h3><div id="top5"></div><p>선생님 화면에서 시상식을 함께 봐요!</p>
+</section>
+</main>
+<div id="boost" class="boostov" hidden><div>🎁 부스터 상자가 열렸어요!<b class="num" id="bn"></b>보너스 점수</div></div>
+<div id="sync" class="sync"></div>
+
+<script>
+let me = JSON.parse(sessionStorage.getItem('mrace-player') || 'null'), room = null, cur = null, busy = false, loading = false, sync = null, sel = VEHICLES[0], celeb = false, qn = 0;
+const code = new URLSearchParams(location.search).get('code');
+if (code) $('#room').value = code.replace(/\D/g, '').slice(0, 4);
+
+/* Step 2: 입장 */
+VEHICLES.forEach(v => {
+  const b = el('button', 'veh' + (v === sel ? ' on' : ''), v); b.type = 'button';
+  b.onclick = () => { sel = v; $$('.veh').forEach(x => x.classList.toggle('on', x === b)); };
+  $('#vehs').append(b);
+});
+$('#go').onclick = async () => {
+  try {
+    $('#err').textContent = '';
+    const room_ = $('#room').value.trim(), nick = $('#nick').value.trim();
+    const r = await rpc('join_room', { p_room: room_, p_nick: nick, p_animal: sel });
+    me = { player_id: r.player_id, token: r.token, room: room_, nick, animal: sel };
+    sessionStorage.setItem('mrace-player', JSON.stringify(me)); begin();
+  } catch (e) { $('#err').textContent = e.message; }
+};
+$('#again').onclick = e => { e.preventDefault(); leave(); };
+function leave() { if (sync) sync.stop(); sync = null; sessionStorage.removeItem('mrace-player'); me = null; cur = null; show('v-join'); }
+
+async function begin() {
+  $('#wv').textContent = me.animal; $('#wn').textContent = me.nick; $('#pv').textContent = me.animal; $('#pn').textContent = me.nick;
+  await syncClock();
+  if (sync) sync.stop();
+  sync = startSync([{ table: 'rooms', filter: 'id=eq.' + me.room }], refresh); refresh();
+}
+
+/* Step 3: 방 상태에 따라 화면 선택 */
+async function refresh() {
+  if (!me || loading) return;
+  const { data: rm } = await db.from('rooms').select('*').eq('id', me.room).maybeSingle();
+  if (!rm) { leave(); return; }
+  room = rm;
+  if (rm.status === 'waiting') { show('v-wait'); $('#wmsg').textContent = '선생님이 시작하면 바로 문제가 나와요!'; }
+  else if (rm.status === 'playing') { if (!cur && !busy) await loadQ(); }
+  else await endView();
+}
+setInterval(() => {
+  if (!room || room.status !== 'playing' || !room.ends_at) return;
+  const left = Date.parse(room.ends_at) - now();
+  $('#tm').textContent = mmss(left); $('#bar').style.width = Math.max(0, Math.min(100, left / (room.duration * 1000) * 100)) + '%';
+  $('#gold').hidden = !(room.golden_until && Date.parse(room.golden_until) - now() > 0);
+}, 250);
+
+/* Step 4: 문제 풀기 (정답은 DB가 채점) */
+async function loadQ() {
+  loading = true;
+  try {
+    const r = await rpc('next_question', { p_player: me.player_id, p_token: me.token });
+    if (r.status === 'playing') { cur = r; show('v-play'); renderQ(); }
+    else if (r.status === 'closing') { show('v-wait'); $('#wmsg').textContent = '시간 끝! 순위를 기다리는 중이에요 🏁'; }
+  } catch (e) { console.error(e); }
+  loading = false;
+  if (room && room.status === 'ended') endView();
+}
+function renderQ() {
+  qn++; $('#qno').textContent = '문제 ' + qn; $('#topic').textContent = TOPICS[cur.topic] || ''; $('#q').textContent = cur.q; $('#plus').textContent = '';
+  $('#opts').replaceChildren(...cur.choices.map((c, i) => {
+    const b = el('button', 'opt opt-' + (i + 1), c); b.onclick = () => pick(b, c); return b;
+  }));
+}
+async function pick(btn, choice) {
+  if (busy) return; busy = true;
+  let r;
+  try { r = await rpc('submit_answer', { p_player: me.player_id, p_token: me.token, p_choice: choice }); }
+  catch (e) { busy = false; return; }
+  if (r.result === 'closed') { busy = false; cur = null; refresh(); return; }
+  if (r.result === 'locked') { busy = false; return; }
+  $$('.opt').forEach(b => { if (b.textContent === r.correct_answer) b.classList.add('good'); });
+  $('#score').textContent = r.score + '점';
+  if (r.result === 'wrong') { btn.classList.add('bad', 'shake'); $('#plus').textContent = '앗! 정답은 ' + r.correct_answer; }
+  else $('#plus').textContent = '정답! +' + r.gain;
+  if (r.bonus > 0) {          // Step 6: 부스터 상자
+    await sleep(350); $('#bn').textContent = '+' + r.bonus; $('#boost').hidden = false;
+    confetti({ particleCount: 120, spread: 80, origin: { y: .6 } }); await sleep(1600); $('#boost').hidden = true;
+  } else await sleep(r.result === 'correct' ? 500 : 1000);
+  cur = r.next && r.next.q ? r.next : null; busy = false;
+  if (cur) renderQ(); else refresh();
+}
+
+/* Step 5: 끝 화면 */
+async function endView() {
+  if (loading) return; loading = true;
+  try {
+    const { data } = await db.from('players').select('*').eq('room_id', me.room);
+    const pl = rankSort(data || []), i = pl.findIndex(p => p.id === me.player_id), p = pl[i];
+    if (!p) { leave(); return; }
+    show('v-end'); $('#ev').textContent = p.animal; $('#en').textContent = p.nick || p.nickname;
+    $('#rank').textContent = (i + 1) + '등'; $('#es').textContent = `${p.score}점 · ${pl.length}명 중 (정답 ${p.correct} · 보너스 +${p.bonus})`;
+    $('#top5').replaceChildren(...pl.slice(0, 5).map((q, k) => { const r = el('div', 'rowp'); r.append(el('span', '', `${k + 1}. ${q.animal} ${q.nickname}`), el('span', 'num', q.score + '점')); return r; }));
+    if (!celeb && i < 3) { celeb = true; confetti({ particleCount: 140, spread: 90, origin: { y: .5 } }); }
+  } catch (e) { console.error(e); }
+  loading = false;
+}
+if (me) begin(); else show('v-join');
+</script></body></html>
